@@ -1,0 +1,78 @@
+.app {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 40px 20px;
+  text-align: left;
+}
+
+.app h1 {
+  margin: 0 0 8px;
+  font-size: 28px;
+}
+
+.desc {
+  margin: 0 0 24px;
+  color: var(--text);
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
+.desc code {
+  font-size: 0.85em;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 12px;
+  gap: 12px;
+}
+
+.status {
+  font-size: 0.85rem;
+}
+
+.error {
+  color: #dc2626;
+}
+
+.ok {
+  color: #16a34a;
+}
+
+.toolbar button {
+  font: inherit;
+  font-size: 0.9rem;
+  padding: 8px 20px;
+  border-radius: 6px;
+  border: none;
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+  transition: opacity 0.2s;
+}
+
+.toolbar button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.toolbar button:not(:disabled):hover {
+  opacity: 0.85;
+}
+
+.raw, .saved {
+  margin-top: 24px;
+  padding: 16px;
+  background: var(--code-bg);
+  border-radius: 6px;
+  font-size: 0.85rem;
+}
+
+.raw pre, .saved pre {
+  margin: 8px 0 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-family: var(--mono);
+}
