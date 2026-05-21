@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import TemplateEditor from './components/TemplateEditor'
 import type { Placeholder } from './components/TemplateEditor'
-import './components/TemplateEditor.css'
+import './components/TemplateEditor/TemplateEditor.css'
 import './App.css'
 
 const placeholders: Placeholder[] = [
