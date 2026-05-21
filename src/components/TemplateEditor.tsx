@@ -16,7 +16,12 @@ export interface TemplateEditorProps {
   minHeight?: string
 }
 
-const ZWSP = '\u200B' // zero-width space
+const ZWSP = '\u200B'
+
+interface HistoryEntry {
+  value: string
+  selection: { nodePath: number[]; offset: number } | null
+}
 
 function escHtml(text: string): string {
   const d = document.createElement('div')
@@ -31,7 +36,7 @@ function valueToHtml(value: string, phs: Placeholder[]): string {
     if (m) {
       const ph = phs.find(p => p.id === m[1])
       if (ph) {
-        return `<span contenteditable="false" class="tep-chip" data-id="${escHtml(ph.id)}"${ph.required ? ' data-required="true"' : ''}>${escHtml(ph.label)}</span>`
+        return `\u003cspan contenteditable="false" class="tep-chip" data-id="${escHtml(ph.id)}"${ph.required ? ' data-required="true"' : ''}\u003e${escHtml(ph.label)}\u003c/span\u003e`
       }
     }
     return escHtml(part)
@@ -59,6 +64,69 @@ function htmlToValue(el: Node): string {
   return out
 }
 
+function getNodePath(root: Node, target: Node): number[] {
+  const path: number[] = []
+  let node: Node | null = target
+  while (node && node !== root) {
+    const parentNode: Node | null = node.parentNode
+    if (!parentNode) break
+    let index = 0
+    let sibling: Node | null = parentNode.firstChild
+    while (sibling && sibling !== node) {
+      sibling = sibling.nextSibling
+      index++
+    }
+    path.unshift(index)
+    node = parentNode
+  }
+  return path
+}
+
+function getNodeFromPath(root: Node, path: number[]): Node | null {
+  let node: Node | null = root
+  for (const index of path) {
+    if (!node) return null
+    node = node.childNodes[index] || null
+  }
+  return node
+}
+
+function getSelectionState(root: HTMLElement): HistoryEntry['selection'] {
+  const sel = window.getSelection()
+  if (!sel || !sel.rangeCount) return null
+  const range = sel.getRangeAt(0)
+  try {
+    return {
+      nodePath: getNodePath(root, range.startContainer),
+      offset: range.startOffset,
+    }
+  } catch {
+    return null
+  }
+}
+
+function restoreSelectionState(root: HTMLElement, state: HistoryEntry['selection']): void {
+  if (!state) return
+  const node = getNodeFromPath(root, state.nodePath)
+  if (!node) return
+  const sel = window.getSelection()
+  if (!sel) return
+  try {
+    const range = document.createRange()
+    if (node.nodeType === Node.TEXT_NODE) {
+      const maxOffset = (node.textContent || '').length
+      range.setStart(node, Math.min(state.offset, maxOffset))
+    } else {
+      range.setStart(node, Math.min(state.offset, node.childNodes.length))
+    }
+    range.collapse(true)
+    sel.removeAllRanges()
+    sel.addRange(range)
+  } catch {
+    // Ignore invalid selection restoration
+  }
+}
+
 function findPrevChip(node: Node): HTMLElement | null {
   let prev: Node | null = node.previousSibling
   while (prev) {
@@ -84,7 +152,6 @@ function findNextChip(node: Node): HTMLElement | null {
 function isCursorAtStart(node: Node, offset: number): boolean {
   if (node.nodeType === Node.TEXT_NODE) {
     const text = node.textContent || ''
-    // Consider cursor at start if offset is 0 or 1 (after ZWSP)
     return offset <= 1 || text.substring(0, offset).replace(new RegExp(ZWSP, 'g'), '').length === 0
   }
   return offset === 0
@@ -100,26 +167,19 @@ function isCursorAtEnd(node: Node, offset: number): boolean {
 }
 
 function normalizeEditor(editor: HTMLElement): void {
-  // Ensure chips have zero-width spaces around them for cursor navigation
   const chips = editor.querySelectorAll('.tep-chip')
   for (const chip of chips) {
     const prev = chip.previousSibling
     const next = chip.nextSibling
-    
-    // Add ZWSP before chip if needed
     if (!prev || (prev.nodeType === Node.TEXT_NODE && !(prev.textContent || '').endsWith(ZWSP))) {
       const zwspNode = document.createTextNode(ZWSP)
       chip.parentNode?.insertBefore(zwspNode, chip)
     }
-    
-    // Add ZWSP after chip if needed
     if (!next || (next.nodeType === Node.TEXT_NODE && !(next.textContent || '').startsWith(ZWSP))) {
       const zwspNode = document.createTextNode(ZWSP)
       chip.parentNode?.insertBefore(zwspNode, chip.nextSibling)
     }
   }
-  
-  // Remove duplicate ZWSPs
   let node = editor.firstChild
   while (node) {
     const next = node.nextSibling
@@ -161,12 +221,84 @@ export default function TemplateEditor({
   const prevValueRef = useRef(value)
   const isComposing = useRef(false)
 
+  // Custom undo/redo stack
+  const historyRef = useRef<HistoryEntry[]>([{ value, selection: null }])
+  const historyIndexRef = useRef(0)
+  const lastPushTimeRef = useRef(0)
+  const isUndoingRef = useRef(false)
+
+  const pushHistory = useCallback((newValue: string, selection?: HistoryEntry['selection']) => {
+    if (isUndoingRef.current) return
+    const now = Date.now()
+    const editor = editorRef.current
+    const sel = selection ?? (editor ? getSelectionState(editor) : null)
+
+    // Debounce: if last push was < 500ms ago and value is similar, replace it
+    const history = historyRef.current
+    const currentIndex = historyIndexRef.current
+    if (now - lastPushTimeRef.current < 500 && currentIndex > 0) {
+      // Replace the current entry for continuous typing
+      history[currentIndex] = { value: newValue, selection: sel }
+    } else {
+      // Trim any redo states and push new state
+      if (currentIndex < history.length - 1) {
+        historyRef.current = history.slice(0, currentIndex + 1)
+      }
+      historyRef.current.push({ value: newValue, selection: sel })
+      historyIndexRef.current = historyRef.current.length - 1
+    }
+    lastPushTimeRef.current = now
+
+    // Limit history size
+    if (historyRef.current.length > 100) {
+      historyRef.current = historyRef.current.slice(-100)
+      historyIndexRef.current = historyRef.current.length - 1
+    }
+  }, [])
+
+  const applyHistoryEntry = useCallback((entry: HistoryEntry) => {
+    const editor = editorRef.current
+    if (!editor) return
+    isUndoingRef.current = true
+    isUpdatingDom.current = true
+
+    editor.innerHTML = valueToHtml(entry.value, placeholders)
+    normalizeEditor(editor)
+    prevValueRef.current = entry.value
+    onChange(entry.value)
+
+    // Restore selection after DOM update
+    requestAnimationFrame(() => {
+      restoreSelectionState(editor, entry.selection)
+      isUpdatingDom.current = false
+      isUndoingRef.current = false
+    })
+  }, [placeholders, onChange])
+
+  const undo = useCallback(() => {
+    if (historyIndexRef.current > 0) {
+      historyIndexRef.current--
+      const entry = historyRef.current[historyIndexRef.current]
+      applyHistoryEntry(entry)
+    }
+  }, [applyHistoryEntry])
+
+  const redo = useCallback(() => {
+    if (historyIndexRef.current < historyRef.current.length - 1) {
+      historyIndexRef.current++
+      const entry = historyRef.current[historyIndexRef.current]
+      applyHistoryEntry(entry)
+    }
+  }, [applyHistoryEntry])
+
   // Set initial content
   useEffect(() => {
     if (editorRef.current) {
       editorRef.current.innerHTML = valueToHtml(value, placeholders)
       normalizeEditor(editorRef.current)
       prevValueRef.current = value
+      historyRef.current = [{ value, selection: null }]
+      historyIndexRef.current = 0
     }
   }, [])
 
@@ -194,7 +326,8 @@ export default function TemplateEditor({
     const newVal = readValue()
     prevValueRef.current = newVal
     onChange(newVal)
-  }, [readValue, onChange])
+    pushHistory(newVal)
+  }, [readValue, onChange, pushHistory])
 
   const insertPlaceholder = useCallback((ph: Placeholder) => {
     if (!editorRef.current) return
@@ -217,7 +350,6 @@ export default function TemplateEditor({
       const braceIdx = text.lastIndexOf('{', offset - 1)
 
       if (braceIdx !== -1) {
-        // Remove from { to cursor, insert chip
         const beforeBrace = text.substring(0, braceIdx)
         const afterCursor = text.substring(offset)
 
@@ -230,7 +362,6 @@ export default function TemplateEditor({
           container.parentNode?.insertBefore(chip, afterNode)
         }
       } else {
-        // No brace, insert at cursor position
         const before = text.substring(0, offset)
         const after = text.substring(offset)
         container.textContent = before
@@ -245,11 +376,10 @@ export default function TemplateEditor({
 
     normalizeEditor(editorRef.current)
 
-    // Move cursor after chip (after the ZWSP that follows it)
     const newRange = document.createRange()
     const refNode = chip.nextSibling
     if (refNode && refNode.nodeType === Node.TEXT_NODE) {
-      newRange.setStart(refNode, 1) // After ZWSP
+      newRange.setStart(refNode, 1)
     } else {
       newRange.setStartAfter(chip)
     }
@@ -269,7 +399,6 @@ export default function TemplateEditor({
     normalizeEditor(editorRef.current)
     emitChange()
 
-    // Check for { trigger pattern
     const before = getTextBeforeCursor()
     if (before !== null) {
       const openMatch = before.match(/\{([^}]*)$/)
@@ -291,7 +420,6 @@ export default function TemplateEditor({
       } else {
         const closeMatch = before.match(/\{[^}]*\}$/)
         if (closeMatch) setShowSuggestions(false)
-        // Also hide suggestions if cursor moved away from the pattern
         if (showSuggestions && !before.includes('{')) {
           setShowSuggestions(false)
         }
@@ -300,6 +428,18 @@ export default function TemplateEditor({
   }, [emitChange, showSuggestions])
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
+    // Handle undo/redo
+    if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) {
+      e.preventDefault()
+      undo()
+      return
+    }
+    if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || (e.key === 'z' && e.shiftKey))) {
+      e.preventDefault()
+      redo()
+      return
+    }
+
     const filtered = showSuggestions
       ? placeholders.filter(ph => {
           const f = filterText.toLowerCase()
@@ -337,7 +477,6 @@ export default function TemplateEditor({
     const container = range.startContainer
     const offset = range.startOffset
 
-    // Handle arrow keys around chips
     if (e.key === 'ArrowLeft') {
       if (container.nodeType === Node.TEXT_NODE && isCursorAtStart(container, offset)) {
         const chip = findPrevChip(container)
@@ -366,7 +505,7 @@ export default function TemplateEditor({
           const newRange = document.createRange()
           const nextText = chip.nextSibling
           if (nextText && nextText.nodeType === Node.TEXT_NODE) {
-            newRange.setStart(nextText, 1) // After ZWSP
+            newRange.setStart(nextText, 1)
           } else {
             newRange.setStartAfter(chip)
           }
@@ -386,7 +525,6 @@ export default function TemplateEditor({
         if (chip) {
           if (chip.dataset.required === 'true') {
             e.preventDefault()
-            // Move cursor before the chip
             const newRange = document.createRange()
             const prevText = chip.previousSibling
             if (prevText && prevText.nodeType === Node.TEXT_NODE) {
@@ -401,7 +539,6 @@ export default function TemplateEditor({
           }
           e.preventDefault()
           chip.remove()
-          // Clean up orphaned ZWSP nodes
           normalizeEditor(editorRef.current!)
           const newRange = document.createRange()
           newRange.setStart(container, 0)
@@ -444,7 +581,7 @@ export default function TemplateEditor({
       }
       return
     }
-  }, [showSuggestions, suggestionIndex, filterText, placeholders, insertPlaceholder, emitChange])
+  }, [showSuggestions, suggestionIndex, filterText, placeholders, insertPlaceholder, emitChange, undo, redo])
 
   const handlePaste = useCallback((e: React.ClipboardEvent) => {
     e.preventDefault()
@@ -530,7 +667,6 @@ export default function TemplateEditor({
     }
   }, [emitChange])
 
-  // Handle composition events for IME input
   const handleCompositionStart = useCallback(() => {
     isComposing.current = true
   }, [])
@@ -540,7 +676,6 @@ export default function TemplateEditor({
     handleInput()
   }, [handleInput])
 
-  // Handle click on chips - prevent placing cursor inside them
   const handleClick = useCallback((e: React.MouseEvent) => {
     const target = e.target as HTMLElement
     if (target.classList.contains('tep-chip')) {
@@ -554,7 +689,6 @@ export default function TemplateEditor({
 
       const newRange = document.createRange()
       if (clickX < midX) {
-        // Clicked left side - place cursor before chip
         const prevText = target.previousSibling
         if (prevText && prevText.nodeType === Node.TEXT_NODE) {
           newRange.setStart(prevText, (prevText.textContent || '').length)
@@ -562,10 +696,9 @@ export default function TemplateEditor({
           newRange.setStartBefore(target)
         }
       } else {
-        // Clicked right side - place cursor after chip
         const nextText = target.nextSibling
         if (nextText && nextText.nodeType === Node.TEXT_NODE) {
-          newRange.setStart(nextText, 1) // After ZWSP
+          newRange.setStart(nextText, 1)
         } else {
           newRange.setStartAfter(target)
         }
@@ -577,7 +710,6 @@ export default function TemplateEditor({
     }
   }, [])
 
-  // Handle mouse down on chips
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
     const target = e.target as HTMLElement
     if (target.classList.contains('tep-chip')) {
