@@ -32,7 +32,7 @@
 }
 
 .tep-chip {
-  display: inline;
+  display: inline-block;
   background: var(--accent-bg);
   color: var(--accent);
   border: 1px solid var(--accent-border);
@@ -46,6 +46,7 @@
   white-space: nowrap;
   unicode-bidi: -moz-isolate;
   unicode-bidi: isolate;
+  vertical-align: baseline;
 }
 
 .tep-chip[data-required="true"] {

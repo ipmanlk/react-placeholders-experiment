@@ -16,6 +16,8 @@ export interface TemplateEditorProps {
   minHeight?: string
 }
 
+const ZWSP = '\u200B' // zero-width space
+
 function escHtml(text: string): string {
   const d = document.createElement('div')
   d.textContent = text
@@ -23,6 +25,7 @@ function escHtml(text: string): string {
 }
 
 function valueToHtml(value: string, phs: Placeholder[]): string {
+  if (!value) return ''
   return value.split(/(\{[^}]+\})/).map(part => {
     const m = part.match(/^\{([^}]+)\}$/)
     if (m) {
@@ -60,7 +63,7 @@ function findPrevChip(node: Node): HTMLElement | null {
   let prev: Node | null = node.previousSibling
   while (prev) {
     if (prev instanceof HTMLElement && !prev.isContentEditable && prev.classList.contains('tep-chip')) return prev
-    if (prev.nodeType === Node.TEXT_NODE && prev.textContent) break
+    if (prev.nodeType === Node.TEXT_NODE && prev.textContent && prev.textContent !== ZWSP) break
     if (prev instanceof HTMLElement && prev.isContentEditable !== false) break
     prev = prev.previousSibling
   }
@@ -71,9 +74,70 @@ function findNextChip(node: Node): HTMLElement | null {
   let next: Node | null = node.nextSibling
   while (next) {
     if (next instanceof HTMLElement && !next.isContentEditable && next.classList.contains('tep-chip')) return next
-    if (next.nodeType === Node.TEXT_NODE && next.textContent) break
+    if (next.nodeType === Node.TEXT_NODE && next.textContent && next.textContent !== ZWSP) break
     if (next instanceof HTMLElement && next.isContentEditable !== false) break
     next = next.nextSibling
+  }
+  return null
+}
+
+function isCursorAtStart(node: Node, offset: number): boolean {
+  if (node.nodeType === Node.TEXT_NODE) {
+    const text = node.textContent || ''
+    // Consider cursor at start if offset is 0 or 1 (after ZWSP)
+    return offset <= 1 || text.substring(0, offset).replace(new RegExp(ZWSP, 'g'), '').length === 0
+  }
+  return offset === 0
+}
+
+function isCursorAtEnd(node: Node, offset: number): boolean {
+  if (node.nodeType === Node.TEXT_NODE) {
+    const text = node.textContent || ''
+    return offset >= text.length - 1 || text.substring(offset).replace(new RegExp(ZWSP, 'g'), '').length === 0
+  }
+  const children = (node as HTMLElement).childNodes
+  return offset >= children.length
+}
+
+function normalizeEditor(editor: HTMLElement): void {
+  // Ensure chips have zero-width spaces around them for cursor navigation
+  const chips = editor.querySelectorAll('.tep-chip')
+  for (const chip of chips) {
+    const prev = chip.previousSibling
+    const next = chip.nextSibling
+    
+    // Add ZWSP before chip if needed
+    if (!prev || (prev.nodeType === Node.TEXT_NODE && !(prev.textContent || '').endsWith(ZWSP))) {
+      const zwspNode = document.createTextNode(ZWSP)
+      chip.parentNode?.insertBefore(zwspNode, chip)
+    }
+    
+    // Add ZWSP after chip if needed
+    if (!next || (next.nodeType === Node.TEXT_NODE && !(next.textContent || '').startsWith(ZWSP))) {
+      const zwspNode = document.createTextNode(ZWSP)
+      chip.parentNode?.insertBefore(zwspNode, chip.nextSibling)
+    }
+  }
+  
+  // Remove duplicate ZWSPs
+  let node = editor.firstChild
+  while (node) {
+    const next = node.nextSibling
+    if (node.nodeType === Node.TEXT_NODE && node.textContent === ZWSP + ZWSP) {
+      node.textContent = ZWSP
+    }
+    node = next
+  }
+}
+
+function getTextBeforeCursor(): string | null {
+  const sel = window.getSelection()
+  if (!sel || !sel.rangeCount) return null
+  const range = sel.getRangeAt(0)
+  const node = range.startContainer
+  const offset = range.startOffset
+  if (node.nodeType === Node.TEXT_NODE) {
+    return (node.textContent || '').substring(0, offset)
   }
   return null
 }
@@ -95,11 +159,13 @@ export default function TemplateEditor({
   const isUpdatingDom = useRef(false)
   const suppressInput = useRef(false)
   const prevValueRef = useRef(value)
+  const isComposing = useRef(false)
 
   // Set initial content
   useEffect(() => {
     if (editorRef.current) {
       editorRef.current.innerHTML = valueToHtml(value, placeholders)
+      normalizeEditor(editorRef.current)
       prevValueRef.current = value
     }
   }, [])
@@ -114,6 +180,7 @@ export default function TemplateEditor({
     }
     isUpdatingDom.current = true
     editorRef.current.innerHTML = valueToHtml(value, placeholders)
+    normalizeEditor(editorRef.current)
     isUpdatingDom.current = false
     prevValueRef.current = value
   }, [value, placeholders])
@@ -122,17 +189,12 @@ export default function TemplateEditor({
     return editorRef.current ? htmlToValue(editorRef.current) : ''
   }, [])
 
-  const getTextBeforeCursor = useCallback((): string | null => {
-    const sel = window.getSelection()
-    if (!sel || !sel.rangeCount) return null
-    const range = sel.getRangeAt(0)
-    const node = range.startContainer
-    const offset = range.startOffset
-    if (node.nodeType === Node.TEXT_NODE) {
-      return (node.textContent || '').substring(0, offset)
-    }
-    return null
-  }, [])
+  const emitChange = useCallback(() => {
+    if (!editorRef.current) return
+    const newVal = readValue()
+    prevValueRef.current = newVal
+    onChange(newVal)
+  }, [readValue, onChange])
 
   const insertPlaceholder = useCallback((ph: Placeholder) => {
     if (!editorRef.current) return
@@ -162,30 +224,32 @@ export default function TemplateEditor({
         if (beforeBrace.length === 0 && afterCursor.length === 0) {
           container.parentNode?.replaceChild(chip, container)
         } else {
-          container.textContent = beforeBrace + afterCursor
-          container.parentNode?.insertBefore(chip, container.nextSibling)
+          container.textContent = beforeBrace
+          const afterNode = document.createTextNode(afterCursor)
+          container.parentNode?.insertBefore(afterNode, container.nextSibling)
+          container.parentNode?.insertBefore(chip, afterNode)
         }
       } else {
         // No brace, insert at cursor position
         const before = text.substring(0, offset)
         const after = text.substring(offset)
         container.textContent = before
-        container.parentNode?.insertBefore(chip, container.nextSibling)
-        if (after) {
-          const afterNode = document.createTextNode(after)
-          container.parentNode?.insertBefore(afterNode, chip.nextSibling)
-        }
+        const afterNode = document.createTextNode(after)
+        container.parentNode?.insertBefore(afterNode, container.nextSibling)
+        container.parentNode?.insertBefore(chip, afterNode)
       }
     } else {
       range.deleteContents()
       range.insertNode(chip)
     }
 
-    // Move cursor after chip
+    normalizeEditor(editorRef.current)
+
+    // Move cursor after chip (after the ZWSP that follows it)
     const newRange = document.createRange()
     const refNode = chip.nextSibling
-    if (refNode) {
-      newRange.setStartBefore(refNode)
+    if (refNode && refNode.nodeType === Node.TEXT_NODE) {
+      newRange.setStart(refNode, 1) // After ZWSP
     } else {
       newRange.setStartAfter(chip)
     }
@@ -196,17 +260,14 @@ export default function TemplateEditor({
     editorRef.current.focus()
     setShowSuggestions(false)
     suppressInput.current = true
-    const newVal = readValue()
-    prevValueRef.current = newVal
-    onChange(newVal)
-  }, [readValue, onChange])
+    emitChange()
+  }, [emitChange])
 
   const handleInput = useCallback(() => {
-    if (isUpdatingDom.current || !editorRef.current) return
+    if (isUpdatingDom.current || !editorRef.current || isComposing.current) return
 
-    const newVal = readValue()
-    prevValueRef.current = newVal
-    onChange(newVal)
+    normalizeEditor(editorRef.current)
+    emitChange()
 
     // Check for { trigger pattern
     const before = getTextBeforeCursor()
@@ -236,7 +297,7 @@ export default function TemplateEditor({
         }
       }
     }
-  }, [readValue, onChange, getTextBeforeCursor, showSuggestions])
+  }, [emitChange, showSuggestions])
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
     const filtered = showSuggestions
@@ -270,20 +331,69 @@ export default function TemplateEditor({
       }
     }
 
-    if (e.key === 'Backspace') {
-      const sel = window.getSelection()
-      if (!sel || !sel.rangeCount || !sel.isCollapsed) return
-      const range = sel.getRangeAt(0)
-      const container = range.startContainer
-      const offset = range.startOffset
+    const sel = window.getSelection()
+    if (!sel || !sel.rangeCount) return
+    const range = sel.getRangeAt(0)
+    const container = range.startContainer
+    const offset = range.startOffset
 
-      if (container.nodeType === Node.TEXT_NODE && offset === 0) {
+    // Handle arrow keys around chips
+    if (e.key === 'ArrowLeft') {
+      if (container.nodeType === Node.TEXT_NODE && isCursorAtStart(container, offset)) {
+        const chip = findPrevChip(container)
+        if (chip) {
+          e.preventDefault()
+          const newRange = document.createRange()
+          const prevText = chip.previousSibling
+          if (prevText && prevText.nodeType === Node.TEXT_NODE) {
+            newRange.setStart(prevText, (prevText.textContent || '').length)
+          } else {
+            newRange.setStartBefore(chip)
+          }
+          newRange.collapse(true)
+          sel.removeAllRanges()
+          sel.addRange(newRange)
+        }
+      }
+      return
+    }
+
+    if (e.key === 'ArrowRight') {
+      if (container.nodeType === Node.TEXT_NODE && isCursorAtEnd(container, offset)) {
+        const chip = findNextChip(container)
+        if (chip) {
+          e.preventDefault()
+          const newRange = document.createRange()
+          const nextText = chip.nextSibling
+          if (nextText && nextText.nodeType === Node.TEXT_NODE) {
+            newRange.setStart(nextText, 1) // After ZWSP
+          } else {
+            newRange.setStartAfter(chip)
+          }
+          newRange.collapse(true)
+          sel.removeAllRanges()
+          sel.addRange(newRange)
+        }
+      }
+      return
+    }
+
+    if (e.key === 'Backspace') {
+      if (!sel.isCollapsed) return
+
+      if (container.nodeType === Node.TEXT_NODE && isCursorAtStart(container, offset)) {
         const chip = findPrevChip(container)
         if (chip) {
           if (chip.dataset.required === 'true') {
             e.preventDefault()
+            // Move cursor before the chip
             const newRange = document.createRange()
-            newRange.setStartBefore(chip)
+            const prevText = chip.previousSibling
+            if (prevText && prevText.nodeType === Node.TEXT_NODE) {
+              newRange.setStart(prevText, (prevText.textContent || '').length - 1)
+            } else {
+              newRange.setStartBefore(chip)
+            }
             newRange.collapse(true)
             sel.removeAllRanges()
             sel.addRange(newRange)
@@ -291,6 +401,8 @@ export default function TemplateEditor({
           }
           e.preventDefault()
           chip.remove()
+          // Clean up orphaned ZWSP nodes
+          normalizeEditor(editorRef.current!)
           const newRange = document.createRange()
           newRange.setStart(container, 0)
           newRange.collapse(true)
@@ -298,44 +410,41 @@ export default function TemplateEditor({
           sel.addRange(newRange)
           editorRef.current?.focus()
           suppressInput.current = true
-          const newVal = readValue()
-          prevValueRef.current = newVal
-          onChange(newVal)
+          emitChange()
         }
       }
+      return
     }
 
     if (e.key === 'Delete') {
-      const sel = window.getSelection()
-      if (!sel || !sel.rangeCount || !sel.isCollapsed) return
-      const range = sel.getRangeAt(0)
-      const container = range.startContainer
-      const offset = range.startOffset
+      if (!sel.isCollapsed) return
 
-      if (container.nodeType === Node.TEXT_NODE && offset >= (container.textContent || '').length) {
+      if (container.nodeType === Node.TEXT_NODE && isCursorAtEnd(container, offset)) {
         const chip = findNextChip(container)
         if (chip) {
           e.preventDefault()
           if (chip.dataset.required === 'true') {
             const newRange = document.createRange()
-            newRange.setStartAfter(chip)
+            const nextText = chip.nextSibling
+            if (nextText && nextText.nodeType === Node.TEXT_NODE) {
+              newRange.setStart(nextText, 1)
+            } else {
+              newRange.setStartAfter(chip)
+            }
             newRange.collapse(true)
             sel.removeAllRanges()
             sel.addRange(newRange)
           } else {
             chip.remove()
-            if (container.textContent === '' && container.parentNode) {
-              container.parentNode.removeChild(container)
-            }
+            normalizeEditor(editorRef.current!)
             suppressInput.current = true
-            const newVal = readValue()
-            prevValueRef.current = newVal
-            onChange(newVal)
+            emitChange()
           }
         }
       }
+      return
     }
-  }, [showSuggestions, suggestionIndex, filterText, placeholders, insertPlaceholder, readValue, onChange])
+  }, [showSuggestions, suggestionIndex, filterText, placeholders, insertPlaceholder, emitChange])
 
   const handlePaste = useCallback((e: React.ClipboardEvent) => {
     e.preventDefault()
@@ -373,31 +482,109 @@ export default function TemplateEditor({
     sel.removeAllRanges()
     sel.addRange(range)
 
+    normalizeEditor(editorRef.current)
     suppressInput.current = true
-    const newVal = readValue()
-    prevValueRef.current = newVal
-    onChange(newVal)
-  }, [placeholders, readValue, onChange])
+    emitChange()
+  }, [placeholders, emitChange])
 
-  const handleCut = useCallback((e: React.ClipboardEvent) => {
-    const sel = window.getSelection()
-    if (!sel || sel.isCollapsed || !editorRef.current) return
+  // Native cut/copy handlers for proper clipboard access
+  useEffect(() => {
+    const editor = editorRef.current
+    if (!editor) return
 
-    e.preventDefault()
-    const range = sel.getRangeAt(0)
-    const contents = range.cloneContents()
-    const valueFormat = htmlToValue(contents)
-    e.clipboardData.setData('text/plain', valueFormat)
+    const handleNativeCopy = (e: ClipboardEvent) => {
+      const sel = window.getSelection()
+      if (!sel || sel.isCollapsed || !editor.contains(sel.anchorNode)) return
 
-    range.deleteContents()
-    sel.removeAllRanges()
-    editorRef.current.focus()
+      e.preventDefault()
+      const range = sel.getRangeAt(0)
+      const contents = range.cloneContents()
+      const valueFormat = htmlToValue(contents)
+      e.clipboardData?.setData('text/plain', valueFormat)
+    }
 
-    suppressInput.current = true
-    const newVal = readValue()
-    prevValueRef.current = newVal
-    onChange(newVal)
-  }, [readValue, onChange])
+    const handleNativeCut = (e: ClipboardEvent) => {
+      const sel = window.getSelection()
+      if (!sel || sel.isCollapsed || !editor.contains(sel.anchorNode)) return
+
+      e.preventDefault()
+      const range = sel.getRangeAt(0)
+      const contents = range.cloneContents()
+      const valueFormat = htmlToValue(contents)
+      e.clipboardData?.setData('text/plain', valueFormat)
+
+      range.deleteContents()
+      sel.removeAllRanges()
+      editor.focus()
+
+      normalizeEditor(editor)
+      suppressInput.current = true
+      emitChange()
+    }
+
+    editor.addEventListener('copy', handleNativeCopy)
+    editor.addEventListener('cut', handleNativeCut)
+    return () => {
+      editor.removeEventListener('copy', handleNativeCopy)
+      editor.removeEventListener('cut', handleNativeCut)
+    }
+  }, [emitChange])
+
+  // Handle composition events for IME input
+  const handleCompositionStart = useCallback(() => {
+    isComposing.current = true
+  }, [])
+
+  const handleCompositionEnd = useCallback(() => {
+    isComposing.current = false
+    handleInput()
+  }, [handleInput])
+
+  // Handle click on chips - prevent placing cursor inside them
+  const handleClick = useCallback((e: React.MouseEvent) => {
+    const target = e.target as HTMLElement
+    if (target.classList.contains('tep-chip')) {
+      e.preventDefault()
+      const sel = window.getSelection()
+      if (!sel) return
+
+      const rect = target.getBoundingClientRect()
+      const clickX = e.clientX
+      const midX = rect.left + rect.width / 2
+
+      const newRange = document.createRange()
+      if (clickX < midX) {
+        // Clicked left side - place cursor before chip
+        const prevText = target.previousSibling
+        if (prevText && prevText.nodeType === Node.TEXT_NODE) {
+          newRange.setStart(prevText, (prevText.textContent || '').length)
+        } else {
+          newRange.setStartBefore(target)
+        }
+      } else {
+        // Clicked right side - place cursor after chip
+        const nextText = target.nextSibling
+        if (nextText && nextText.nodeType === Node.TEXT_NODE) {
+          newRange.setStart(nextText, 1) // After ZWSP
+        } else {
+          newRange.setStartAfter(target)
+        }
+      }
+      newRange.collapse(true)
+      sel.removeAllRanges()
+      sel.addRange(newRange)
+      editorRef.current?.focus()
+    }
+  }, [])
+
+  // Handle mouse down on chips
+  const handleMouseDown = useCallback((e: React.MouseEvent) => {
+    const target = e.target as HTMLElement
+    if (target.classList.contains('tep-chip')) {
+      e.preventDefault()
+      handleClick(e)
+    }
+  }, [handleClick])
 
   return (
     <div className="tep-root">
@@ -408,7 +595,10 @@ export default function TemplateEditor({
         onInput={handleInput}
         onKeyDown={handleKeyDown}
         onPaste={handlePaste}
-        onCut={handleCut}
+        onCompositionStart={handleCompositionStart}
+        onCompositionEnd={handleCompositionEnd}
+        onClick={handleClick}
+        onMouseDown={handleMouseDown}
         suppressContentEditableWarning
         data-placeholder={placeholderText}
         style={{ minHeight }}
